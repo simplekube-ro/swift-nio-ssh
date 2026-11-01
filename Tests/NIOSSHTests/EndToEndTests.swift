@@ -537,6 +537,67 @@ class EndToEndTests: XCTestCase {
         XCTAssertEqual(self.channel.activeServerChannels.count, 1)
     }
 
+    func testWindowAdjustRefusedDuringKeyExchangeIsReissuedAfterExhaustingWindow() throws {
+        try self.channel.configureWithHarness(TestHarness())
+        try self.channel.activate()
+        try self.channel.interactInMemory()
+
+        let readRecorder = ReadRecordingHandler()
+        var clientChannel = Optional<Channel>.none
+        self.channel.clientSSHHandler?.createChannel { channel, _ in
+            clientChannel = channel
+            do {
+                try channel.pipeline.syncOperations.addHandler(readRecorder)
+            } catch {
+                return channel.eventLoop.makeFailedFuture(error)
+            }
+            return channel.setOption(ChannelOptions.autoRead, value: false)
+        }
+        try self.channel.interactInMemory()
+        let client = try XCTUnwrap(clientChannel)
+        let server = try XCTUnwrap(self.channel.activeServerChannels.first)
+
+        func bytesRead() -> Int {
+            readRecorder.reads.reduce(0) { total, read in
+                guard case .byteBuffer(let buffer) = read.data else {
+                    return total
+                }
+                return total + buffer.readableBytes
+            }
+        }
+
+        // Exhaust the peer's entire window while the client buffers the data without reading.
+        let windowSize = Constants.defaultMaximumChannelPacketSize * Constants.channelWindowSizePacketMultiple
+        server.writeAndFlush(
+            SSHChannelData(type: .channel, data: .byteBuffer(ByteBuffer(repeating: 1, count: windowSize))),
+            promise: nil
+        )
+        try self.channel.interactInMemory()
+        XCTAssertEqual(bytesRead(), 0)
+
+        // Drain every buffered byte during rekeying, when all window adjustments are refused.
+        try self.channel.clientSSHHandler!._rekey()
+        client.read()
+        XCTAssertEqual(bytesRead(), windowSize)
+        try self.channel.interactInMemory()
+
+        // Rekeying has finished, but the peer has no window left. Even one more byte requires a new
+        // window adjustment, and there are no buffered reads left to trigger that adjustment.
+        server.writeAndFlush(
+            SSHChannelData(type: .channel, data: .byteBuffer(ByteBuffer(repeating: 2, count: 1))),
+            promise: nil
+        )
+        try client.setOption(ChannelOptions.autoRead, value: true).wait()
+        client.read()
+        try self.channel.interactInMemory()
+
+        XCTAssertEqual(
+            bytesRead(),
+            windowSize + 1,
+            "Rekeying must restore the exhausted window even when no further reads can trigger an adjustment"
+        )
+    }
+
     /// A child channel credits its window increment before it writes the CHANNEL_WINDOW_ADJUST. While a key
     /// exchange is in progress the connection refuses channel messages, so that adjust never reaches the peer.
     /// If the increment stays credited, we believe the peer still has a full window, so we never send another
